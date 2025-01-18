@@ -1,0 +1,19 @@
+# Rust build artifacts
+/target/
+
+# Rust toolchain files
+**/*.rs.bk
+
+# Cargo.lock (optional, depends on your project)
+Cargo.lock
+
+# macOS system files
+.DS_Store
+
+# Linux system files
+*.swp
+
+# Windows system files
+Thumbs.db
+
+http-cacache
