@@ -1,16 +1,14 @@
 extern crate spider;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-
 use spider::tokio;
 use spider::website::Website;
 
 use html2md::parse_html;
-use playwright::Playwright;
 use reqwest::Error;
 use std::env;
-
-static GLOBAL_URL_COUNT: AtomicUsize = AtomicUsize::new(0);
+use futures::StreamExt;
+use chromiumoxide::browser::{Browser, BrowserConfig};
+use chromiumoxide::cdp::browser_protocol::page::NavigateParams;
 
 async fn fetch_html(url: &str) -> Result<String, Error> {
     let response = reqwest::get(url).await?;
@@ -18,17 +16,38 @@ async fn fetch_html(url: &str) -> Result<String, Error> {
     Ok(body)
 }
 
-async fn fetch_html_chrome(url: &str) -> Result<String, playwright::Error> {
-    let playwright = Playwright::initialize().await?;
-    playwright.prepare()?;
-    let chromium = playwright.chromium();
-    let browser = chromium.launcher().headless(true).launch().await?;
-    let context = browser.context_builder().build().await?;
-    let page = context.new_page().await?;
+async fn fetch_html_chrome(url: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let (mut browser, mut handler) =
+        Browser::launch(BrowserConfig::builder().with_head().build()?).await?;
 
-    page.goto_builder(url).goto().await?;
+    let handle = tokio::task::spawn(async move {
+        while let Some(event) = handler.next().await {
+            if let Err(err) = event {
+                eprintln!("Browser Event Error: {:?}", err);
+            }
+        }
+    });
+
+    let page = browser.new_page(url).await?;
+
+    page.http_future(NavigateParams {
+        url: url.to_string(),
+        transition_type: None,
+        frame_id: None,
+        referrer: None,
+        referrer_policy: None,
+    })?
+    .await?;
+
+    if let Err(err) = page.wait_for_navigation().await {
+        eprintln!("Navigation Error: {:?}", err);
+    }
 
     let html_content = page.content().await?;
+
+    browser.close().await?;
+    handle.await?;
+
     Ok(html_content)
 }
 
@@ -49,56 +68,43 @@ async fn main() {
         return;
     }
 
-    let mut website: Website = Website::new("https://heygoody.com")
-        .with_caching(true)
-        .build()
-        .unwrap();
 
-    let start = std::time::Instant::now();
+    let mut website: Website = Website::new("https://heygoody.com");
 
-    let mut rx2 = website.subscribe(500).unwrap();
+    website
+        .configuration
+        .with_respect_robots_txt(true)
+        .with_user_agent(Some("SpiderBot"))
+        .with_ignore_sitemap(true) // ignore running the sitemap on base crawl/scape methods. Remove or set to true to include the sitemap with the crawl.
+        .with_sitemap(Some("/sitemap/sitemap-0.xml"));
 
-    let subscription = async move {
-        while let Ok(res) = rx2.recv().await {
-            if args[1] == "http" {
-                match fetch_html(res.get_url()).await {
-                    Ok(html) => {
-                        // println!("HTML:\n{}", html)
-                        let markdown = convert_html_to_markdown(html).await;
-                        println!("{}", markdown);
-                    }
-                    Err(e) => eprintln!("Error at fetching URL: {}", e),
+    // crawl the sitemap first
+    website.crawl_sitemap().await;
+    // persist links to the next crawl
+    website.persist_links();
+    // crawl normal with links found in the sitemap extended.
+    website.crawl().await;
+
+    let links = website.get_all_links_visited().await;
+
+    for link in links.iter() {
+        if args[1] == "http" {
+            match fetch_html(link).await {
+                Ok(html) => {
+                    // println!("HTML:\n{}", html)
+                    let markdown = convert_html_to_markdown(html).await;
+                    println!("{}", markdown);
                 }
-            } else if args[1] == "chrome" {
-                match fetch_html_chrome(res.get_url()).await {
-                    Ok(html) => {
-                        let markdown = convert_html_to_markdown(html).await;
-                        println!("{}", markdown);
-                    }
-                    Err(e) => eprintln!("Error at fetching URL: {}", e),
-                }
+                Err(e) => eprintln!("Error at fetching URL: {}", e),
             }
-
-            GLOBAL_URL_COUNT.fetch_add(1, Ordering::Relaxed);
+        } else if args[1] == "chrome" {
+            match fetch_html_chrome(link).await {
+                Ok(html) => {
+                    let markdown = convert_html_to_markdown(html).await;
+                    println!("{}", markdown);
+                }
+                Err(e) => eprintln!("Error at fetching URL: {}", e),
+            }
         }
-    };
-
-    let crawl = async move {
-        website.crawl_raw().await;
-        website.unsubscribe();
-    };
-
-    tokio::pin!(subscription);
-
-    tokio::select! {
-        _ = crawl => (),
-        _ = subscription => (),
-    };
-
-    let duration = start.elapsed();
-
-    println!(
-        "Time elapsed in website.crawl() is: {:?} for total pages: {:?}",
-        duration, GLOBAL_URL_COUNT
-    )
+    }
 }
